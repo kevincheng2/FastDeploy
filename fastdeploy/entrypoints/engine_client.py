@@ -21,7 +21,7 @@ import numpy as np
 
 from fastdeploy import envs
 from fastdeploy.input.preprocess import InputPreprocessor
-from fastdeploy.inter_communicator import IPCSignal, ZmqClient
+from fastdeploy.inter_communicator import IPCSignal, ZmqIpcClient
 from fastdeploy.metrics.work_metrics import work_process_metrics
 from fastdeploy.platforms import current_platform
 from fastdeploy.utils import EngineError, StatefulSemaphore, api_server_logger
@@ -45,6 +45,7 @@ class EngineClient:
         data_parallel_size=1,
         enable_logprob=False,
         workers=1,
+        tool_parser=None,
     ):
         input_processor = InputPreprocessor(
             tokenizer,
@@ -52,6 +53,7 @@ class EngineClient:
             limit_mm_per_prompt,
             mm_processor_kwargs,
             enable_mm,
+            tool_parser,
         )
         self.enable_logprob = enable_logprob
         self.enable_mm = enable_mm
@@ -83,7 +85,7 @@ class EngineClient:
         """
         Create a ZMQ client.
         """
-        self.zmq_client = ZmqClient(model, mode)
+        self.zmq_client = ZmqIpcClient(model, mode)
         self.zmq_client.connect()
 
     def format_and_add_data(self, prompts: dict):
@@ -119,8 +121,6 @@ class EngineClient:
             task["prompt_token_ids_len"] = len(task["prompt_token_ids"])
             input_ids_len = task["prompt_token_ids_len"]
             task["max_tokens"] = min(self.max_model_len - input_ids_len, task.get("max_tokens"))
-            if task.get("reasoning_max_tokens", None) is None:
-                task["reasoning_max_tokens"] = max(int(task["max_tokens"] * 0.8), 1)
             min_tokens = task.get("min_tokens", 1)
             if "messages" in task:
                 del task["messages"]
@@ -152,7 +152,7 @@ class EngineClient:
             max_stop_seqs_num = int(envs.FD_MAX_STOP_SEQS_NUM)
             if len(stop_seqs_len) > max_stop_seqs_num:
                 error_msg = (
-                    f"Length of stop ({stop_seqs_len}) exceeds the limit max_model_len({max_stop_seqs_num})."
+                    f"Length of stop ({stop_seqs_len}) exceeds the limit max_stop_seqs_num({max_stop_seqs_num})."
                     "Please reduce the number of stop or set a lager max_stop_seqs_num by `FD_MAX_STOP_SEQS_NUM`"
                 )
                 api_server_logger.error(error_msg)
@@ -161,7 +161,7 @@ class EngineClient:
             for single_stop_seq_len in stop_seqs_len:
                 if single_stop_seq_len > stop_seqs_max_len:
                     error_msg = (
-                        f"Length of stop_seqs({single_stop_seq_len}) exceeds the limit max_model_len({stop_seqs_max_len})."
+                        f"Length of stop_seqs({single_stop_seq_len}) exceeds the limit stop_seqs_max_len({stop_seqs_max_len})."
                         "Please reduce the length of stop sequences or set a larger stop_seqs_max_len by `FD_STOP_SEQS_MAX_LEN`"
                     )
                     api_server_logger.error(error_msg)
@@ -190,35 +190,35 @@ class EngineClient:
         Validate stream options
         """
 
-        if data.get("n"):
+        if data.get("n") is not None:
             if data["n"] != 1:
                 raise ValueError("n only support 1.")
 
-        if data.get("max_tokens"):
+        if data.get("max_tokens") is not None:
             if data["max_tokens"] < 1 or data["max_tokens"] >= self.max_model_len:
                 raise ValueError(f"max_tokens can be defined [1, {self.max_model_len}).")
 
-        if data.get("reasoning_max_tokens"):
+        if data.get("reasoning_max_tokens") is not None:
             if data["reasoning_max_tokens"] > data["max_tokens"] or data["reasoning_max_tokens"] < 1:
                 raise ValueError("reasoning_max_tokens must be between max_tokens and 1")
 
-        if data.get("top_p"):
+        if data.get("top_p") is not None:
             if data["top_p"] > 1 or data["top_p"] < 0:
                 raise ValueError("top_p value can only be defined [0, 1].")
 
-        if data.get("frequency_penalty"):
+        if data.get("frequency_penalty") is not None:
             if not -2.0 <= data["frequency_penalty"] <= 2.0:
                 raise ValueError("frequency_penalty must be in [-2, 2]")
 
-        if data.get("temperature"):
+        if data.get("temperature") is not None:
             if data["temperature"] < 0:
                 raise ValueError("temperature must be non-negative")
 
-        if data.get("presence_penalty"):
+        if data.get("presence_penalty") is not None:
             if not -2.0 <= data["presence_penalty"] <= 2.0:
                 raise ValueError("presence_penalty must be in [-2, 2]")
 
-        if data.get("seed"):
+        if data.get("seed") is not None:
             if not 0 <= data["seed"] <= 922337203685477580:
                 raise ValueError("seed must be in [0, 922337203685477580]")
 

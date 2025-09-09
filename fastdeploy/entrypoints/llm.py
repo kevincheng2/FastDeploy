@@ -28,8 +28,7 @@ from tqdm import tqdm
 from fastdeploy.engine.args_utils import EngineArgs
 from fastdeploy.engine.engine import LLMEngine
 from fastdeploy.engine.sampling_params import SamplingParams
-
-# from fastdeploy.entrypoints.chat_utils import ChatCompletionMessageParam
+from fastdeploy.entrypoints.openai.tool_parsers import ToolParserManager
 from fastdeploy.utils import llm_logger, retrive_model_from_server
 from fastdeploy.worker.output import Logprob, LogprobsLists
 
@@ -73,6 +72,9 @@ class LLM:
         **kwargs,
     ):
         model = retrive_model_from_server(model, revision)
+        tool_parser_plugin = kwargs.get("tool_parser_plugin")
+        if tool_parser_plugin:
+            ToolParserManager.import_tool_parser(tool_parser_plugin)
         engine_args = EngineArgs(
             model=model,
             tokenizer=tokenizer,
@@ -238,7 +240,7 @@ class LLM:
         self,
         prompts,
         sampling_params,
-        chat_template_kwargs: Optional[dict[str, Any]] = None,
+        **kwargs,
     ):
         """
             添加一个请求到 LLM Engine，并返回该请求的 ID。
@@ -279,10 +281,7 @@ class LLM:
                 current_sampling_params = sampling_params[i]
             else:
                 current_sampling_params = sampling_params
-            enable_thinking = None
-            if chat_template_kwargs is not None:
-                enable_thinking = chat_template_kwargs.get("enable_thinking", None)
-            self.llm_engine.add_requests(tasks, current_sampling_params, enable_thinking=enable_thinking)
+            self.llm_engine.add_requests(tasks, current_sampling_params, **kwargs)
         return req_ids
 
     def _decode_token(self, token_id: int) -> str:

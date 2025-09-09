@@ -276,6 +276,15 @@ class TokenProcessor:
                 self.resource_manager.stop_flags[index] = True
                 self.resource_manager.tasks_list[index] = None
                 self.resource_manager._recycle_block_tables(task)
+
+        task_used_block_num = sum([len(task.block_tables) if task else 0 for task in self.resource_manager.tasks_list])
+        main_process_metrics.available_gpu_block_num.set(
+            self.resource_manager.total_block_number() - task_used_block_num
+        )
+        main_process_metrics.batch_size.set(
+            self.resource_manager.max_num_seqs - self.resource_manager.available_batch()
+        )
+
         if task_id in self.tokens_counter:
             del self.tokens_counter[task_id]
 
@@ -315,6 +324,13 @@ class TokenProcessor:
         scores = self.output_scores[: batch * (K + 1)].numpy().reshape([batch, K + 1])[:, : (K + 1)]
         ranks = self.output_ranks[:batch].numpy()
         batch_result = list()
+        if envs.ENABLE_V1_KVCACHE_SCHEDULER:
+            need_to_be_reschedule_req_ids = list(self.resource_manager.to_be_rescheduled_request_id_set)
+            for request_id in need_to_be_reschedule_req_ids:
+                if self.resource_manager.requests[request_id].idx >= (
+                    batch - 1
+                ):  # No more token generated for preempted request
+                    self.resource_manager.reschedule_preempt_task(request_id)
         for i in range(batch):
             if self.resource_manager.stop_flags[i]:
                 continue
@@ -326,6 +342,9 @@ class TokenProcessor:
             if recovery_stop:
                 llm_logger.info(f"recovery stop signal found at task {task_id}")
             if not recovery_stop and token_id < 0:
+                if envs.ENABLE_V1_KVCACHE_SCHEDULER:
+                    if task_id in self.resource_manager.to_be_rescheduled_request_id_set:
+                        self.resource_manager.reschedule_preempt_task(task_id)
                 continue
 
             if task.get("prefill_chunk_info", None) is not None:
@@ -341,6 +360,7 @@ class TokenProcessor:
                 metrics = RequestMetrics(
                     arrival_time=task.arrival_time,
                     inference_start_time=task.inference_start_time,
+                    model_execute_time=time.time() - task.inference_start_time,
                     first_token_time=time.time() - task.inference_start_time,
                     time_in_queue=task.schedule_start_time - task.preprocess_end_time,
                     preprocess_cost_time=task.preprocess_end_time - task.preprocess_start_time,
@@ -383,6 +403,7 @@ class TokenProcessor:
                 self.tokens_counter[task_id] += 1
                 if token_id != RECOVERY_STOP_SIGNAL:
                     result.outputs.token_ids.append(token_id)
+                    task.output_token_ids.append(token_id)
                     result.outputs.logprob = float(scores[i, 0])
                     # Construct top_logprobs
                     topk_token_ids = tokens[i, :].tolist()
@@ -435,7 +456,9 @@ class TokenProcessor:
         if envs.ENABLE_V1_KVCACHE_SCHEDULER:
             need_to_be_reschedule_req_ids = list(self.resource_manager.to_be_rescheduled_request_id_set)
             for request_id in need_to_be_reschedule_req_ids:
-                if self.resource_manager.requests[request_id].idx >= (batch - 1):  # No more token generated for preempted request
+                if self.resource_manager.requests[request_id].idx >= (
+                    batch - 1
+                ):  # No more token generated for preempted request
                     self.resource_manager.reschedule_preempt_task(request_id)
         for i in range(batch):
             if self.resource_manager.stop_flags[i]:
@@ -463,8 +486,9 @@ class TokenProcessor:
                 if recovery_stop:
                     llm_logger.info(f"recovery stop signal found at task {task_id}")
                 if not recovery_stop and token_id < 0:
-                    if task_id in self.resource_manager.to_be_rescheduled_request_id_set:
-                        self.resource_manager.reschedule_preempt_task(task_id)
+                    if envs.ENABLE_V1_KVCACHE_SCHEDULER:
+                        if task_id in self.resource_manager.to_be_rescheduled_request_id_set:
+                            self.resource_manager.reschedule_preempt_task(task_id)
                     continue
 
             if task.get("prefill_chunk_info", None) is not None:
@@ -480,6 +504,7 @@ class TokenProcessor:
                 metrics = RequestMetrics(
                     arrival_time=task.arrival_time,
                     inference_start_time=task.inference_start_time,
+                    model_execute_time=time.time() - task.inference_start_time,
                     first_token_time=time.time() - task.inference_start_time,
                     time_in_queue=task.schedule_start_time - task.preprocess_end_time,
                     preprocess_cost_time=task.preprocess_end_time - task.preprocess_start_time,
@@ -491,6 +516,7 @@ class TokenProcessor:
             else:
                 metrics = RequestMetrics(
                     arrival_time=time.time(),
+                    model_execute_time=time.time() - task.inference_start_time,
                     request_start_time=task.arrival_time,
                 )
             self.number_of_output_tokens += len(token_ids)
@@ -556,6 +582,7 @@ class TokenProcessor:
     def _record_first_token_metrics(self, task, current_time):
         """Record metrics for first token"""
         task.first_token_time = current_time
+        main_process_metrics.first_token_latency.set(current_time - task.inference_start_time)
         main_process_metrics.time_to_first_token.observe(current_time - task.inference_start_time)
         main_process_metrics.request_queue_time.observe(task.schedule_start_time - task.preprocess_end_time)
 
@@ -567,6 +594,7 @@ class TokenProcessor:
 
         main_process_metrics.num_requests_running.dec(1)
         main_process_metrics.request_success_total.inc()
+        main_process_metrics.infer_latency.set(current_time - task.inference_start_time)
         main_process_metrics.request_inference_time.observe(current_time - task.inference_start_time)
         main_process_metrics.request_generation_tokens.observe(self.tokens_counter[task.request_id])
 

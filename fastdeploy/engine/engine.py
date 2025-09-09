@@ -47,12 +47,14 @@ from fastdeploy.inter_communicator import (
     EngineCacheQueue,
     EngineWorkerQueue,
     IPCSignal,
-    ZmqClient,
+    ZmqIpcServer,
+    ZmqTcpServer,
 )
 from fastdeploy.metrics.metrics import main_process_metrics
 from fastdeploy.metrics.trace_util import start_span, start_span_request
 from fastdeploy.model_executor.guided_decoding import schema_checker
 from fastdeploy.output.token_processor import TokenProcessor, WarmUpTokenProcessor
+from fastdeploy.splitwise.internal_adapter_utils import InternalAdapter
 from fastdeploy.splitwise.splitwise_connector import SplitwiseConnector
 from fastdeploy.utils import EngineError, console_logger, envs, llm_logger
 
@@ -106,6 +108,7 @@ class LLMEngine:
             cfg.limit_mm_per_prompt,
             cfg.mm_processor_kwargs,
             cfg.enable_mm,
+            cfg.tool_parser,
         )
 
         self.start_queue_service()
@@ -123,8 +126,9 @@ class LLMEngine:
                 cfg.max_num_seqs, cfg, cfg.tensor_parallel_size, cfg.splitwise_role
             )
 
-        os.environ["INFERENCE_MSG_QUEUE_ID"] = str(self.cfg.engine_worker_queue_port)
-
+        os.environ["INFERENCE_MSG_QUEUE_ID"] = str(
+            self.cfg.engine_worker_queue_port + self.cfg.worker_num_per_node * self.cfg.node_rank
+        )
         self.split_connector = SplitwiseConnector(cfg, self.scheduler, self.engine_worker_queue, self.resource_manager)
 
         self.token_processor = TokenProcessor(
@@ -179,9 +183,19 @@ class LLMEngine:
         self.data_processor = self.input_processor.create_processor()
 
         if api_server_pid is not None:
-            self.zmq_server = ZmqClient(name=api_server_pid, mode=zmq.PULL)
-            self.zmq_server.start_server()
-            self.zmq_server.create_router()
+            if envs.FD_ENABLE_INTERNAL_ADAPTER:
+                self.recv_request_server = ZmqTcpServer(port=envs.FD_ZMQ_RECV_REQUEST_SERVER_PORT, mode=zmq.PULL)
+                self.send_response_server = ZmqTcpServer(port=envs.FD_ZMQ_SEND_RESPONSE_SERVER_PORT, mode=zmq.ROUTER)
+                self.external_adapter = InternalAdapter(
+                    cfg=self.cfg, engine=self, dp_rank=self.cfg.node_rank * self.cfg.worker_num_per_node
+                )
+            else:
+                self.recv_request_server = ZmqIpcServer(name=api_server_pid, mode=zmq.PULL)
+                self.send_response_server = ZmqIpcServer(name=api_server_pid, mode=zmq.ROUTER)
+            self.recv_result_handle_thread = threading.Thread(
+                target=self.send_response_server.recv_result_handle, daemon=True
+            )
+            self.recv_result_handle_thread.start()
             time.sleep(3)
 
         if self.do_profile == 0 and (
@@ -196,13 +210,42 @@ class LLMEngine:
                 engine_worker_queue_port=self.cfg.engine_worker_queue_port,
                 pid_suffix=self.ipc_signal_suffix,
             )
-            self.launched_cache_manager_signal.value[0] = 1
 
         self.worker_proc = self._start_worker_service()
-        console_logger.info("Waitting worker processes ready...")
+        console_logger.info("Waiting for worker processes to be ready...")
         time.sleep(5)
         self.worker_init_status = dict()
-        if not self.check_worker_initialize_status():
+
+        result_container = {}
+
+        def check_worker_initialize_status_func(res: dict):
+            res["worker_is_alive"] = True
+            if not self.check_worker_initialize_status():
+                console_logger.error("Failed to launch worker processes, check log/workerlog.* for more details.")
+                res["worker_is_alive"] = False
+
+        self.check_worker_initialize_status_func_thread = threading.Thread(
+            target=check_worker_initialize_status_func, args=(result_container,), daemon=True
+        )
+        self.check_worker_initialize_status_func_thread.start()
+
+        # Wait model loading
+        while self.loaded_model_signal.value[0] == 0:
+            # Make sure worker process is alive
+            if not self.check_worker_initialize_status_func_thread.is_alive():
+                return False
+            time.sleep(1)
+
+        if self.do_profile:
+            self._stop_profile()
+        # Launch components: scheduler, cache_manager, expert_service et.al.
+        self.launch_components()
+        if self.cfg.cache_config.enable_prefix_caching or self.cfg.splitwise_role != "mixed":
+            self.launched_cache_manager_signal.value[0] = 1
+
+        # Worker launched
+        self.check_worker_initialize_status_func_thread.join()
+        if not result_container["worker_is_alive"]:
             console_logger.error("Failed to launch worker processes, check log/workerlog.* for more details.")
             return False
 
@@ -213,68 +256,6 @@ class LLMEngine:
             self.warmup()
             self._del_warmup_token_processor()
             console_logger.info("Warmup finished")
-
-        self.token_processor.tasks_queue = self.engine_worker_queue
-
-        if envs.ENABLE_V1_KVCACHE_SCHEDULER:
-            self.insert_task_to_worker_thread = threading.Thread(target=self._scheduler_task_to_worker_v1, daemon=True)
-        else:
-            self.insert_task_to_worker_thread = threading.Thread(target=self._insert_task_to_worker, daemon=True)
-        self.insert_task_to_worker_thread.start()
-
-        if self.api_server_pid is not None:
-            self.insert_task_to_scheduler_thread = threading.Thread(
-                target=self._insert_zmq_task_to_scheduler, daemon=True
-            )
-            self.insert_task_to_scheduler_thread.start()
-
-            self.receive_output_thread = threading.Thread(target=self._zmq_send_generated_tokens, daemon=True)
-            self.receive_output_thread.start()
-
-        # Start TokenProcessor thread
-        self.token_processor.run()
-
-        if self.cfg.splitwise_role != "mixed":
-            # 单机逻辑
-            self.engine_worker_queue.available_prefill_instances.put(1)
-            self.split_mode_get_tasks()
-            if self.cfg.scheduler_config.name == "splitwise":
-                self.splitwise_receive_thread = threading.Thread(target=self.split_connector.start_receiver, args=())
-                self.splitwise_receive_thread.daemon = True
-                self.splitwise_receive_thread.start()
-
-        self.cfg.init_cache_info()
-
-        role = self.cfg.splitwise_role
-        host_ip = self.cfg.host_ip
-        disaggregate = self.cfg.disaggregate_info
-        if self.cfg.scheduler_config.name == "splitwise":
-            self.scheduler.start(role, host_ip, disaggregate)
-
-        time.sleep(1)
-
-        if self.cfg.parallel_config.enable_expert_parallel and self.cfg.parallel_config.data_parallel_size > 1:
-            self.dp_processed = []
-            for i in range(
-                1,
-                self.cfg.parallel_config.data_parallel_size // self.cfg.nnode,
-            ):
-                time.sleep(1)
-                self.dp_processed.append(
-                    multiprocessing.Process(
-                        target=start_expert_service,
-                        args=(
-                            self.cfg,
-                            i + self.cfg.node_rank * self.cfg.worker_num_per_node,
-                            self.ipc_signal_suffix,
-                        ),
-                    )
-                )
-                llm_logger.info(
-                    f"Engine is initialized successfully with {self.cfg.tensor_parallel_size}"
-                    + f" data parallel id {i}"
-                )
-                self.dp_processed[-1].start()
 
         console_logger.info(f"Worker processes are launched with {time.time() - start_time} seconds.")
         return True
@@ -291,7 +272,7 @@ class LLMEngine:
                     time.sleep(0.005)
                     continue
                 for request_id, contents in results.items():
-                    self.zmq_server.send_multipart(request_id, contents)
+                    self.send_response_server.send_response(request_id, contents)
 
             except Exception as e:
                 llm_logger.error(f"Unexcepted error happend: {e}, {traceback.format_exc()!s}")
@@ -374,9 +355,9 @@ class LLMEngine:
                 self.cfg.max_prefill_batch,
             )
 
-            self.resource_manager.check_and_free_block_tables()
+            # self.resource_manager.check_and_free_block_tables()
             tasks = self.scheduler.get_requests(
-                available_blocks=self.resource_manager.available_block_num(),
+                available_blocks=self.cfg.cache_config.max_block_num_per_seq,
                 block_size=self.cfg.cache_config.block_size,
                 reserved_output_blocks=self.cfg.cache_config.enc_dec_block_num,
                 max_num_batched_tokens=self.cfg.max_model_len,
@@ -400,6 +381,8 @@ class LLMEngine:
                     get_request_pool.submit(_fetch_request)
                 # 2. Schedule requests
                 tasks = self.resource_manager.schedule()
+                main_process_metrics.num_requests_waiting.dec(len(tasks))
+                main_process_metrics.num_requests_running.inc(len(tasks))
                 # 3. Send to engine
                 if tasks:
                     self.resource_manager.get_real_bsz()
@@ -420,9 +403,9 @@ class LLMEngine:
             try:
                 block = True if len(added_requests) == 0 else False
                 if not self.cfg.enable_mm:
-                    err, data = self.zmq_server.receive_json_once(block)
+                    err, data = self.recv_request_server.receive_json_once(block)
                 else:
-                    err, data = self.zmq_server.receive_pyobj_once(block)
+                    err, data = self.recv_request_server.receive_pyobj_once(block)
                 if err is not None:
                     llm_logger.error("Engine stops inserting zmq task into scheduler, err:{err}")
                     break
@@ -430,19 +413,24 @@ class LLMEngine:
                 request, insert_task = None, []
                 results: List[Tuple[str, Optional[str]]] = list()
                 if data:
-                    request = Request.from_dict(data)
-                    start_span("ENQUEUE_ZMQ", data, trace.SpanKind.PRODUCER)
-
-                    llm_logger.debug(f"Receive request: {request}")
-
                     err_msg = None
-                    if self.guided_decoding_checker is not None:
-                        request, err_msg = self.guided_decoding_checker.schema_format(request)
+                    try:
+                        request = Request.from_dict(data)
+                        start_span("ENQUEUE_ZMQ", data, trace.SpanKind.PRODUCER)
+                        main_process_metrics.requests_number.inc()
+                        llm_logger.debug(f"Receive request: {request}")
+                    except Exception as e:
+                        llm_logger.error(f"Receive request error: {e}, {traceback.format_exc()!s}")
+                        err_msg = str(e)
+                        results.append((data["request_id"], err_msg))
 
-                    if err_msg is not None:
-                        llm_logger.error(err_msg)
-                        results.append((request.request_id, err_msg))
-                    else:
+                    if self.guided_decoding_checker is not None and err_msg is None:
+                        request, err_msg = self.guided_decoding_checker.schema_format(request)
+                        if err_msg is not None:
+                            llm_logger.error(f"Receive request error: {err_msg}")
+                            results.append((request.request_id, err_msg))
+
+                    if err_msg is None:
                         insert_task.append(request)
 
                 response = self.scheduler.put_requests(insert_task)
@@ -454,9 +442,10 @@ class LLMEngine:
                     added_requests[request.request_id] += 1
 
                 for request_id, failed in results:
-                    added_requests[request_id] -= 1
-                    if added_requests[request_id] == 0:
-                        added_requests.pop(request_id)
+                    if request_id in added_requests:
+                        added_requests[request_id] -= 1
+                        if added_requests[request_id] == 0:
+                            added_requests.pop(request_id)
 
                     if failed is None:
                         main_process_metrics.num_requests_waiting.inc(1)
@@ -470,7 +459,7 @@ class LLMEngine:
                     )
                     # Since the request is not in scheduler
                     # Send result by zmq directly
-                    self.zmq_server.send_multipart(request_id, error_result)
+                    self.send_response_server.send_response(request_id, [error_result])
             except Exception as e:
                 llm_logger.error(
                     f"Error happend while receving new request from zmq, details={e}, "
@@ -497,10 +486,7 @@ class LLMEngine:
             request.sampling_params = sampling_params
         request.preprocess_start_time = time.time()
 
-        enable_thinking = None
-        if kwargs is not None:
-            enable_thinking = kwargs.get("enable_thinking", None)
-        request = self.data_processor.process_request(request, self.cfg.max_model_len, enable_thinking=enable_thinking)
+        request = self.data_processor.process_request(request, self.cfg.max_model_len, **kwargs)
         request.prompt_token_ids_len = len(request.prompt_token_ids)
         request.need_prefill_tokens = request.prompt_token_ids_len
         input_ids_len = request.prompt_token_ids_len
@@ -535,7 +521,7 @@ class LLMEngine:
             max_stop_seqs_num = int(envs.FD_MAX_STOP_SEQS_NUM)
             if len(stop_seqs_len) > max_stop_seqs_num:
                 error_msg = (
-                    f"Length of stop ({stop_seqs_len}) exceeds the limit max_model_len({max_stop_seqs_num})."
+                    f"Length of stop ({stop_seqs_len}) exceeds the limit max_stop_seqs_num({max_stop_seqs_num})."
                     "Please reduce the number of stop or set a lager max_stop_seqs_num by `FD_MAX_STOP_SEQS_NUM`"
                 )
                 llm_logger.error(error_msg)
@@ -544,7 +530,7 @@ class LLMEngine:
             for single_stop_seq_len in stop_seqs_len:
                 if single_stop_seq_len > stop_seqs_max_len:
                     error_msg = (
-                        f"Length of stop_seqs({single_stop_seq_len}) exceeds the limit max_model_len({stop_seqs_max_len})."
+                        f"Length of stop_seqs({single_stop_seq_len}) exceeds the limit stop_seqs_max_len({stop_seqs_max_len})."
                         "Please reduce the length of stop sequences or set a larger stop_seqs_max_len by `FD_STOP_SEQS_MAX_LEN`"
                     )
                     llm_logger.error(error_msg)
@@ -939,7 +925,6 @@ class LLMEngine:
             suffix=self.ipc_signal_suffix,
             create=True,
         )
-
         # launched_cache_manager_signal 用于感知engine是否启动了cache_manager
         if self.cfg.cache_config.enable_prefix_caching or self.cfg.splitwise_role != "mixed":
             launched_cache_manager_signal_data = np.zeros([1], dtype=np.int32)
@@ -950,6 +935,29 @@ class LLMEngine:
                 suffix=self.ipc_signal_suffix,
                 create=True,
             )
+
+        # launched_expert_service_signal: Used to sense whether each expet_servic is started successfully
+        if self.cfg.parallel_config.enable_expert_parallel and self.cfg.parallel_config.data_parallel_size > 1:
+            launched_expert_service_signal_data = np.zeros(
+                shape=[self.cfg.parallel_config.data_parallel_size // self.cfg.nnode], dtype=np.int32
+            )
+            self.launched_expert_service_signal = IPCSignal(
+                name="launched_expert_service_signal",
+                array=launched_expert_service_signal_data,
+                dtype=np.int32,
+                suffix=self.ipc_signal_suffix,
+                create=True,
+            )
+
+        # loaded_model_signal: Used to detect whether each worker has completed model loading
+        loaded_model_signal_data = np.zeros([1], dtype=np.int32)
+        self.loaded_model_signal = IPCSignal(
+            name="loaded_model_signal",
+            array=loaded_model_signal_data,
+            dtype=np.int32,
+            suffix=self.ipc_signal_suffix,
+            create=True,
+        )
 
         # worker_live_signal 用于engine感知各worker进程是否存活，记录每个step 时间
         worker_healthy_live_recorded_time_array = np.zeros(shape=[self.cfg.worker_num_per_node], dtype=np.int32)
@@ -1010,8 +1018,12 @@ class LLMEngine:
                 print(f"Error extracting sub services: {e}")
 
         self.engine_worker_queue.cleanup()
-        if hasattr(self, "zmq_server") and self.zmq_server is not None:
-            self.zmq_server.close()
+        if hasattr(self, "send_response_server") and self.send_response_server is not None:
+            self.send_response_server.close()
+        if hasattr(self, "recv_request_server") and self.recv_request_server is not None:
+            self.recv_request_server.close()
+        if hasattr(self, "recv_control_cmd_server") and self.recv_control_cmd_server is not None:
+            self.recv_control_cmd_server.close()
         if hasattr(self, "dp_processed"):
             for p in self.dp_processed:
                 p.join()
@@ -1127,6 +1139,7 @@ class LLMEngine:
             "enable_custom_all_reduce": self.cfg.parallel_config.enable_custom_all_reduce,
             "enable_logprob": self.cfg.enable_logprob,
             "enable_mm": self.cfg.enable_mm,
+            "lm_head_fp32": self.cfg.model_config.lm_head_fp32,
         }
         for worker_flag, value in worker_append_flag.items():
             if value:
@@ -1229,7 +1242,6 @@ class LLMEngine:
                 engine_worker_queue_port=self.cfg.engine_worker_queue_port,
                 pid_suffix=self.ipc_signal_suffix,
             )
-            self.launched_cache_manager_signal.value[0] = 1
 
     def check_health(self, time_interval_threashold=30):
         """
@@ -1242,6 +1254,72 @@ class LLMEngine:
                 return False, "Worker Service Not Healthy"
 
         return True, ""
+
+    def launch_components(self):
+        self.token_processor.tasks_queue = self.engine_worker_queue
+
+        if envs.ENABLE_V1_KVCACHE_SCHEDULER:
+            self.insert_task_to_worker_thread = threading.Thread(target=self._scheduler_task_to_worker_v1, daemon=True)
+        else:
+            self.insert_task_to_worker_thread = threading.Thread(target=self._insert_task_to_worker, daemon=True)
+        self.insert_task_to_worker_thread.start()
+
+        if self.api_server_pid is not None:
+            self.insert_task_to_scheduler_thread = threading.Thread(
+                target=self._insert_zmq_task_to_scheduler, daemon=True
+            )
+            self.insert_task_to_scheduler_thread.start()
+
+            self.receive_output_thread = threading.Thread(target=self._zmq_send_generated_tokens, daemon=True)
+            self.receive_output_thread.start()
+
+        # Start TokenProcessor thread
+        self.token_processor.run()
+
+        if self.cfg.splitwise_role != "mixed":
+            # 单机逻辑
+            self.engine_worker_queue.available_prefill_instances.put(1)
+            self.split_mode_get_tasks()
+            if self.cfg.scheduler_config.name == "splitwise":
+                self.splitwise_receive_thread = threading.Thread(target=self.split_connector.start_receiver, args=())
+                self.splitwise_receive_thread.daemon = True
+                self.splitwise_receive_thread.start()
+
+        self.cfg.init_cache_info()
+
+        role = self.cfg.splitwise_role
+        host_ip = self.cfg.host_ip
+        disaggregate = self.cfg.disaggregate_info
+        if self.cfg.scheduler_config.name == "splitwise":
+            self.scheduler.start(role, host_ip, disaggregate)
+
+        time.sleep(1)
+        expert_service_nums = self.cfg.parallel_config.data_parallel_size // self.cfg.nnode
+        if self.cfg.parallel_config.enable_expert_parallel and self.cfg.parallel_config.data_parallel_size > 1:
+            self.dp_processed = []
+            for i in range(
+                1,
+                expert_service_nums,
+            ):
+                time.sleep(1)
+                self.dp_processed.append(
+                    multiprocessing.Process(
+                        target=start_expert_service,
+                        args=(
+                            self.cfg,
+                            i + self.cfg.node_rank * self.cfg.worker_num_per_node,
+                            self.ipc_signal_suffix,
+                        ),
+                    )
+                )
+                llm_logger.info(
+                    f"Engine is initialized successfully with {self.cfg.tensor_parallel_size}"
+                    + f" data parallel id {i}"
+                )
+                self.dp_processed[-1].start()
+            for i in range(1, expert_service_nums):
+                while self.launched_expert_service_signal.value[i] == 0:
+                    time.sleep(1)
 
     def check_worker_initialize_status(self):
         """
@@ -1268,10 +1346,6 @@ class LLMEngine:
 
         self.checking_worker_status_thread = threading.Thread(target=detect_thread, daemon=True)
         self.checking_worker_status_thread.start()
-        checking_worker_init_kv_cache_status_thread = None
-        if self.do_profile:
-            checking_worker_init_kv_cache_status_thread = threading.Thread(target=self._stop_profile, daemon=True)
-            checking_worker_init_kv_cache_status_thread.start()
 
         # display weight loadding progress
         with tqdm(total=100, desc="Loading Weights") as pbar:
@@ -1302,8 +1376,6 @@ class LLMEngine:
         self.worker_init_status["finished"] = True
         try:
             self.checking_worker_status_thread.join(timeout=1)
-            if checking_worker_init_kv_cache_status_thread is not None:
-                checking_worker_init_kv_cache_status_thread.join(timeout=1)
         except Exception:
             pass
         return True

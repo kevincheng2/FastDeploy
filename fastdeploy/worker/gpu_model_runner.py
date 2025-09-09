@@ -245,18 +245,25 @@ class GPUModelRunner(ModelRunnerBase):
                         ).unsqueeze([0])
                     else:
                         position_ids = None
-
-                    enable_thinking = request.get("enable_thinking", True)
-                    enable_thinking = enable_thinking if enable_thinking is not None else True
-                    self.share_inputs["enable_thinking"][:] = enable_thinking
-                    self.share_inputs["need_think_end"][idx : idx + 1, :] = 1 if enable_thinking else 0
-                    self.share_inputs["reasoning_index"][idx : idx + 1, :] = request.get("reasoning_max_tokens", 2048)
                     self.share_inputs["rope_emb"][idx : idx + 1, :] = self.prepare_rope3d(
                         position_ids, request.get("max_tokens", 2048)
                     )
 
+                if request.get("enable_thinking", False) and request.get("reasoning_max_tokens") is not None:
+                    # Enable thinking
+                    self.share_inputs["enable_thinking"][:] = True
+                    self.share_inputs["need_think_end"][idx : idx + 1, :] = 1
+                    self.share_inputs["reasoning_index"][idx : idx + 1, :] = request.get("reasoning_max_tokens")
+                else:
+                    # Disable thinking
+                    self.share_inputs["enable_thinking"][:] = False
+                    self.share_inputs["need_think_end"][idx : idx + 1, :] = 0
+                    self.share_inputs["reasoning_index"][idx : idx + 1, :] = 0
+
                 input_ids = request.prompt_token_ids + request.output_token_ids
-                logger.debug(f"Handle prefill request {request} at idx {idx} prefill_start_index {prefill_start_index} prefill_end_index {prefill_end_index} need_prefilled_token_num {len(input_ids)}")
+                logger.debug(
+                    f"Handle prefill request {request} at idx {idx} prefill_start_index {prefill_start_index} prefill_end_index {prefill_end_index} need_prefilled_token_num {len(input_ids)}"
+                )
                 self.share_inputs["input_ids"][idx : idx + 1, :length] = np.array(
                     input_ids[prefill_start_index:prefill_end_index]
                 )
@@ -276,6 +283,7 @@ class GPUModelRunner(ModelRunnerBase):
                 self.share_inputs["step_idx"][idx : idx + 1] = (
                     len(request.output_token_ids) if prefill_end_index >= len(input_ids) else 0
                 )
+                self.share_inputs["pre_ids"][idx : idx + 1] = -1
                 has_prefill_task = True
             elif request.task_type.value == RequestType.DECODE.value:  # decode task
                 logger.debug(f"Handle decode request {request} at idx {idx}")
@@ -307,6 +315,10 @@ class GPUModelRunner(ModelRunnerBase):
             self.share_inputs["penalty_score"][idx : idx + 1] = request.get("repetition_penalty", 1.0)
             self.share_inputs["frequency_score"][idx : idx + 1] = request.get("frequency_penalty", 0.0)
             self.share_inputs["presence_score"][idx : idx + 1] = request.get("presence_penalty", 0.0)
+            self.share_inputs["temp_scaled_logprobs"][idx : idx + 1] = request.get("temp_scaled_logprobs", False)
+            self.share_inputs["top_p_normalized_logprobs"][idx : idx + 1] = request.get(
+                "top_p_normalized_logprobs", False
+            )
 
             self.share_inputs["min_dec_len"][idx : idx + 1] = request.get("min_tokens", 1)
             self.share_inputs["max_dec_len"][idx : idx + 1] = request.get(
@@ -445,15 +457,21 @@ class GPUModelRunner(ModelRunnerBase):
                     self.share_inputs["prompt_lens"][idx : idx + 1] = length
 
                 if self.enable_mm:
-                    enable_thinking = request.get("enable_thinking", True)
-                    enable_thinking = enable_thinking if enable_thinking is not None else True
-                    self.share_inputs["enable_thinking"][:] = enable_thinking
-                    self.share_inputs["need_think_end"][idx : idx + 1, :] = 1 if enable_thinking else 0
-                    self.share_inputs["reasoning_index"][idx : idx + 1, :] = request.get("reasoning_max_tokens", 2048)
                     self.share_inputs["rope_emb"][idx : idx + 1, :] = self.prepare_rope3d(
                         position_ids, request.get("max_tokens", 2048)
                     )
                     self.share_inputs["seq_lens_decoder"][idx : idx + 1] = 0
+
+                if request.get("enable_thinking", False) and request.get("reasoning_max_tokens") is not None:
+                    # Enable thinking
+                    self.share_inputs["enable_thinking"][:] = True
+                    self.share_inputs["need_think_end"][idx : idx + 1, :] = 1
+                    self.share_inputs["reasoning_index"][idx : idx + 1, :] = request.get("reasoning_max_tokens")
+                else:
+                    # Disable thinking
+                    self.share_inputs["enable_thinking"][:] = False
+                    self.share_inputs["need_think_end"][idx : idx + 1, :] = 0
+                    self.share_inputs["reasoning_index"][idx : idx + 1, :] = 0
 
             def get_attr_from_request(request, attr, default_value=None):
                 res = request.get(attr, default_value)
@@ -478,6 +496,12 @@ class GPUModelRunner(ModelRunnerBase):
             )
             self.share_inputs["presence_score"][idx : idx + 1] = get_attr_from_request(
                 request, "presence_penalty", 0.0
+            )
+            self.share_inputs["temp_scaled_logprobs"][idx : idx + 1] = get_attr_from_request(
+                request, "temp_scaled_logprobs", False
+            )
+            self.share_inputs["top_p_normalized_logprobs"][idx : idx + 1] = get_attr_from_request(
+                request, "top_p_normalized_logprobs", False
             )
 
             self.share_inputs["min_dec_len"][idx : idx + 1] = request.get("min_tokens", 1)
@@ -608,6 +632,8 @@ class GPUModelRunner(ModelRunnerBase):
         self.share_inputs["presence_score"] = paddle.full(
             [max_num_seqs, 1], self.model_config.presence_score, dtype="float32"
         )
+        self.share_inputs["temp_scaled_logprobs"] = paddle.full([max_num_seqs, 1], False, dtype="bool")
+        self.share_inputs["top_p_normalized_logprobs"] = paddle.full([max_num_seqs, 1], False, dtype="bool")
 
         self.share_inputs["min_dec_len"] = paddle.full([max_num_seqs, 1], self.model_config.min_length, dtype="int64")
         self.share_inputs["max_dec_len"] = paddle.full(
@@ -617,7 +643,9 @@ class GPUModelRunner(ModelRunnerBase):
         self.share_inputs["max_length"] = paddle.full(
             [max_num_seqs, 1], self.model_config.max_model_len, dtype="int64"
         )
-        self.seq_lens_this_time_buffer = paddle.full(max_num_seqs, 0, dtype="int32")
+        self.seq_lens_this_time_buffer = paddle.full([max_num_seqs, 1], 0, dtype="int32")
+        if self.fd_config.parallel_config.enable_expert_parallel:
+            self.share_inputs["seq_lens_this_time"] = paddle.full([max_num_seqs, 1], 0, dtype="int32")
         self.share_inputs["seq_lens_encoder"] = paddle.full([max_num_seqs, 1], 0, dtype="int32")
         self.share_inputs["seq_lens_decoder"] = paddle.full([max_num_seqs, 1], 0, dtype="int32")
         self.share_inputs["step_seq_lens_encoder"] = paddle.full([max_num_seqs, 1], 0, dtype="int32")
@@ -664,6 +692,11 @@ class GPUModelRunner(ModelRunnerBase):
 
         # Initialize rotary position embedding
         tmp_position_ids = paddle.arange(self.parallel_config.max_model_len).reshape((1, -1))
+
+        # Initialize thinking related buffers
+        self.share_inputs["need_think_end"] = paddle.full(shape=[max_num_seqs, 1], fill_value=0, dtype="int32")
+        self.share_inputs["enable_thinking"] = paddle.full(shape=[1], fill_value=False, dtype="bool")
+        self.share_inputs["reasoning_index"] = paddle.full(shape=[max_num_seqs, 1], fill_value=0, dtype="int32")
 
         # TODO(gongshaotian): move to models
         if not self.enable_mm:
@@ -751,9 +784,6 @@ class GPUModelRunner(ModelRunnerBase):
                 dtype="float32",
             )
             self.share_inputs["image_features"] = None
-            self.share_inputs["need_think_end"] = paddle.full(shape=[max_num_seqs, 1], fill_value=0, dtype="int32")
-            self.share_inputs["enable_thinking"] = paddle.full(shape=[1], fill_value=True, dtype="bool")
-            self.share_inputs["reasoning_index"] = paddle.full(shape=[max_num_seqs, 1], fill_value=0, dtype="int32")
 
     def _prepare_inputs(self) -> None:
         """Prepare the model inputs"""
@@ -823,6 +853,9 @@ class GPUModelRunner(ModelRunnerBase):
             max_num_logprobs=20 if self.enable_logprob else None,
             enable_early_stop=self.enable_early_stop,
             stop_flags=self.share_inputs["stop_flags"],
+            temp_scaled_logprobs=self.share_inputs["temp_scaled_logprobs"],
+            top_p_normalized_logprobs=self.share_inputs["top_p_normalized_logprobs"],
+            share_inputs=self.share_inputs,
         )
 
     def load_model(self) -> None:
@@ -1102,10 +1135,10 @@ class GPUModelRunner(ModelRunnerBase):
                 ),
                 accept_tokens=(self.share_inputs["accept_tokens"] if self.speculative_decoding else None),
                 accept_num=(self.share_inputs["accept_num"] if self.speculative_decoding else None),
-                enable_thinking=(self.share_inputs["enable_thinking"] if self.enable_mm else None),
-                think_end_id=(self.model_config.think_end_id if self.enable_mm else -1),
-                need_think_end=(self.share_inputs["need_think_end"] if self.enable_mm else None),
-                reasoning_index=(self.share_inputs["reasoning_index"] if self.enable_mm else None),
+                enable_thinking=self.share_inputs["enable_thinking"],
+                think_end_id=self.model_config.think_end_id,
+                need_think_end=self.share_inputs["need_think_end"],
+                reasoning_index=self.share_inputs["reasoning_index"],
                 stop_token_ids=self.share_inputs["stop_seqs"],
                 stop_seqs_len=self.share_inputs["stop_seqs_len"],
             )
@@ -1370,10 +1403,10 @@ class GPUModelRunner(ModelRunnerBase):
             ),
             accept_tokens=(self.share_inputs["accept_tokens"] if self.speculative_decoding else None),
             accept_num=(self.share_inputs["accept_num"] if self.speculative_decoding else None),
-            enable_thinking=(self.share_inputs["enable_thinking"] if self.enable_mm else None),
-            think_end_id=(self.model_config.think_end_id if self.enable_mm else -1),
-            need_think_end=(self.share_inputs["need_think_end"][:num_running_requests] if self.enable_mm else None),
-            reasoning_index=(self.share_inputs["reasoning_index"][:num_running_requests] if self.enable_mm else None),
+            enable_thinking=self.share_inputs["enable_thinking"],
+            think_end_id=self.model_config.think_end_id,
+            need_think_end=self.share_inputs["need_think_end"][:num_running_requests],
+            reasoning_index=self.share_inputs["reasoning_index"][:num_running_requests],
             stop_token_ids=self.share_inputs["stop_seqs"],
             stop_seqs_len=self.share_inputs["stop_seqs_len"],
         )

@@ -100,28 +100,29 @@ class OpenAIServingCompletion:
 
         api_server_logger.info(f"start inference for request {num_choices}")
         prompt_batched_token_ids = []
+        text_after_process_list = []
         try:
-            for idx, prompt in enumerate(request_prompts):
-                request_id_idx = f"{request_id}-{idx}"
-                current_req_dict = request.to_dict_for_infer(request_id_idx, prompt)
-                try:
+            if self.max_waiting_time < 0:
+                await self.engine_client.semaphore.acquire()
+            else:
+                await asyncio.wait_for(self.engine_client.semaphore.acquire(), timeout=self.max_waiting_time)
+        except Exception:
+            return ErrorResponse(code=408, message=f"Request queued time exceed {self.max_waiting_time}")
+        try:
+            try:
+                for idx, prompt in enumerate(request_prompts):
+                    request_id_idx = f"{request_id}-{idx}"
+                    current_req_dict = request.to_dict_for_infer(request_id_idx, prompt)
                     current_req_dict["arrival_time"] = time.time()
                     prompt_token_ids = self.engine_client.format_and_add_data(current_req_dict)
                     if isinstance(prompt_token_ids, np.ndarray):
                         prompt_token_ids = prompt_token_ids.tolist()
+                    text_after_process_list.append(current_req_dict.get("text_after_process"))
                     prompt_batched_token_ids.append(prompt_token_ids)
-                except Exception as e:
-                    return ErrorResponse(message=str(e), code=400)
-
-                del current_req_dict
-
-            try:
-                if self.max_waiting_time < 0:
-                    await self.engine_client.semaphore.acquire()
-                else:
-                    await asyncio.wait_for(self.engine_client.semaphore.acquire(), timeout=self.max_waiting_time)
-            except Exception:
-                return ErrorResponse(code=408, message=f"Request queued time exceed {self.max_waiting_time}")
+                    del current_req_dict
+            except Exception as e:
+                self.engine_client.semaphore.release()
+                return ErrorResponse(message=str(e), code=400)
 
             if request.stream:
                 return self.completion_stream_generator(
@@ -131,6 +132,7 @@ class OpenAIServingCompletion:
                     created_time=created_time,
                     model_name=request.model,
                     prompt_batched_token_ids=prompt_batched_token_ids,
+                    text_after_process_list=text_after_process_list,
                 )
             else:
                 try:
@@ -141,6 +143,7 @@ class OpenAIServingCompletion:
                         created_time=created_time,
                         model_name=request.model,
                         prompt_batched_token_ids=prompt_batched_token_ids,
+                        text_after_process_list=text_after_process_list,
                     )
                 except Exception as e:
                     return ErrorResponse(code=400, message=str(e))
@@ -156,6 +159,7 @@ class OpenAIServingCompletion:
         created_time: int,
         model_name: str,
         prompt_batched_token_ids: list(),
+        text_after_process_list: list(),
     ):
         """
         Process the full completion request with multiple choices.
@@ -171,8 +175,8 @@ class OpenAIServingCompletion:
 
             valid_results = [dict()] * num_choices
             output_tokens = [0] * num_choices
-            aggregated_top_logprobs = [[[], [], []]] * num_choices
-            aggregated_token_ids = [[]] * num_choices
+            aggregated_top_logprobs = [[[], [], []] for _ in range(num_choices)]
+            aggregated_token_ids = [[] for _ in range(num_choices)]
             completion_batched_token_ids = [[] for _ in range(num_choices)]
             current_waiting_time = 0
             while num_choices > 0:
@@ -216,8 +220,7 @@ class OpenAIServingCompletion:
                         valid_results[rid] = data
                         num_choices -= 1
                         break
-
-            return self.request_output_to_completion_response(
+            res = self.request_output_to_completion_response(
                 final_res_batch=valid_results,
                 request=request,
                 request_id=request_id,
@@ -225,7 +228,10 @@ class OpenAIServingCompletion:
                 model_name=model_name,
                 prompt_batched_token_ids=prompt_batched_token_ids,
                 completion_batched_token_ids=completion_batched_token_ids,
+                text_after_process_list=text_after_process_list,
             )
+            api_server_logger.info(f"Completion response: {res.model_dump_json()}")
+            return res
         except Exception as e:
             api_server_logger.error(f"Error in completion_full_generator: {e}", exc_info=True)
             raise
@@ -233,6 +239,23 @@ class OpenAIServingCompletion:
             if dealer is not None:
                 dealer.close()
                 self.engine_client.semaphore.release()
+
+    async def _echo_back_prompt(self, request, res, idx):
+        if res["outputs"].get("send_idx", -1) == 0 and request.echo:
+            if isinstance(request.prompt, list):
+                prompt_text = request.prompt[idx]
+            else:
+                prompt_text = request.prompt
+            res["outputs"]["text"] = prompt_text + (res["outputs"]["text"] or "")
+
+    def calc_finish_reason(self, max_tokens, token_num, output, tool_called):
+        if max_tokens is None or token_num != max_tokens:
+            if tool_called or output.get("tool_call"):
+                return "tool_calls"
+            else:
+                return "stop"
+        else:
+            return "length"
 
     async def completion_stream_generator(
         self,
@@ -242,6 +265,7 @@ class OpenAIServingCompletion:
         created_time: int,
         model_name: str,
         prompt_batched_token_ids: list(),
+        text_after_process_list: list(),
     ):
         """
         Process the stream completion request.
@@ -255,11 +279,13 @@ class OpenAIServingCompletion:
             output_tokens = [0] * num_choices
             inference_start_time = [0] * num_choices
             first_iteration = [True] * num_choices
+            tool_called = [False] * num_choices
             max_streaming_response_tokens = (
                 request.max_streaming_response_tokens
                 if request.max_streaming_response_tokens is not None
                 else (request.suffix or {}).get("max_streaming_response_tokens", 1)
             )  # dierctly passed & passed in suffix
+            max_streaming_response_tokens = max(max_streaming_response_tokens, 1)
             choices = []
             chunk = CompletionStreamResponse(
                 id=request_id,
@@ -300,11 +326,16 @@ class OpenAIServingCompletion:
                                         index=idx,
                                         text="",
                                         prompt_token_ids=list(prompt_batched_token_ids[idx]),
+                                        text_after_process=text_after_process_list[idx],
+                                        prompt_tokens=text_after_process_list[idx],
                                         completion_token_ids=None,
                                     )
                                 ],
                             )
                             yield f"data: {chunk.model_dump_json(exclude_unset=True)}\n\n"
+                            api_server_logger.info(
+                                f"Completion Streaming response send_idx 0: {chunk.model_dump_json()}"
+                            )
                         first_iteration[idx] = False
 
                     self.engine_client.data_processor.process_response_dict(
@@ -316,36 +347,51 @@ class OpenAIServingCompletion:
                     else:
                         arrival_time = res["metrics"]["arrival_time"] - inference_start_time[idx]
 
+                    await self._echo_back_prompt(request, res, idx)
                     output = res["outputs"]
                     output_top_logprobs = output["top_logprobs"]
                     logprobs_res: Optional[CompletionLogprobs] = None
                     if request.logprobs and output_top_logprobs is not None:
                         logprobs_res = self._create_completion_logprobs(output_top_logprobs, request.logprobs, 0)
 
-                    choices.append(
-                        CompletionResponseStreamChoice(
-                            index=idx,
-                            text=output["text"],
-                            prompt_token_ids=None,
-                            completion_token_ids=output.get("token_ids") if request.return_token_ids else None,
-                            tool_calls=output.get("tool_call_content"),
-                            reasoning_content=output.get("reasoning_content"),
-                            arrival_time=arrival_time,
-                            logprobs=logprobs_res,
-                        )
-                    )
-                    if res["finished"]:
-                        if request.max_tokens is None or output_tokens[idx] + 1 != request.max_tokens:
-                            chunk.choices[0].finish_reason = "stop"
-                            if (
-                                self.engine_client.reasoning_parser == "ernie_x1"
-                                and output.get("finish_reason", "") == "tool_calls"
-                            ):
-                                chunk.choices[0].finish_reason = "tool_calls"
-                        else:
-                            chunk.choices[0].finish_reason = "length"
-
                     output_tokens[idx] += 1
+                    delta_message = CompletionResponseStreamChoice(
+                        index=idx,
+                        text=output["text"],
+                        prompt_token_ids=None,
+                        completion_token_ids=output.get("token_ids") if request.return_token_ids else None,
+                        tool_calls=None,
+                        raw_prediction=output.get("raw_prediction") if request.return_token_ids else None,
+                        completion_tokens=output.get("raw_prediction") if request.return_token_ids else None,
+                        reasoning_content="",
+                        arrival_time=arrival_time,
+                        logprobs=logprobs_res,
+                    )
+                    if not res["finished"] and "delta_message" in output:
+                        delta_message_output = output["delta_message"]
+                        if delta_message_output is None:
+                            continue
+                        delta_message.text = delta_message_output.content or ""
+                        delta_message.reasoning_content = delta_message_output.reasoning_content or ""
+                        if delta_message_output.tool_calls:
+                            delta_message.tool_calls = delta_message_output.tool_calls
+                            tool_called[idx] = True
+
+                    choices.append(delta_message)
+
+                    if res["finished"]:
+                        choices[-1].finish_reason = self.calc_finish_reason(
+                            request.max_tokens, output_tokens[idx], output, tool_called[idx]
+                        )
+                    send_idx = output.get("send_idx")
+                    # 只有当 send_idx 明确为 0 时才记录日志
+                    if send_idx == 0 and not request.return_token_ids:
+                        chunk_temp = chunk
+                        chunk_temp.choices = choices
+                        api_server_logger.info(
+                            f"Completion Streaming response send_idx 0: {chunk_temp.model_dump_json()}"
+                        )
+                        del chunk_temp
 
                     if len(choices) == max_streaming_response_tokens or res["finished"]:
                         chunk = CompletionStreamResponse(
@@ -368,13 +414,11 @@ class OpenAIServingCompletion:
                                 usage=UsageInfo(
                                     prompt_tokens=len(prompt_batched_token_ids[idx]),
                                     completion_tokens=output_tokens[idx],
+                                    total_tokens=len(prompt_batched_token_ids[idx]) + output_tokens[idx],
                                 ),
                             )
                             yield f"data: {usage_chunk.model_dump_json(exclude_unset=True)}\n\n"
-                if choices:
-                    chunk.choices = choices
-                    yield f"data: {chunk.model_dump_json(exclude_unset=True)}\n\n"
-                    choices = []
+                        api_server_logger.info(f"Completion Streaming response last send: {chunk.model_dump_json()}")
 
         except Exception as e:
             yield f"data: {ErrorResponse(message=str(e), code=400).model_dump_json(exclude_unset=True)}\n\n"
@@ -394,43 +438,37 @@ class OpenAIServingCompletion:
         model_name: str,
         prompt_batched_token_ids: list(),
         completion_batched_token_ids: list(),
+        text_after_process_list: list(),
     ) -> CompletionResponse:
         choices: List[CompletionResponseChoice] = []
         num_prompt_tokens = 0
         num_generated_tokens = 0
-        aggregated_logprobs: Optional[CompletionLogprobs] = None
 
         for idx in range(len(final_res_batch)):
             final_res = final_res_batch[idx]
             prompt_token_ids = prompt_batched_token_ids[idx]
             assert prompt_token_ids is not None
-            prompt_text = final_res["prompt"]
+            prompt_text = request.prompt
             completion_token_ids = completion_batched_token_ids[idx]
 
             output = final_res["outputs"]
             output_top_logprobs = output["top_logprobs"]
 
+            aggregated_logprobs: Optional[CompletionLogprobs] = None
             if output_top_logprobs is not None:
-                logprobs_res = self._create_completion_logprobs(output_top_logprobs, request.logprobs, 0)
-                if aggregated_logprobs is None:
-                    aggregated_logprobs = logprobs_res
-                else:
-                    aggregated_logprobs.tokens.extend(logprobs_res.tokens)
-                    aggregated_logprobs.token_logprobs.extend(logprobs_res.token_logprobs)
-                    aggregated_logprobs.top_logprobs.extend(logprobs_res.top_logprobs)
-                    aggregated_logprobs.text_offset.extend(logprobs_res.text_offset)
+                aggregated_logprobs = self._create_completion_logprobs(output_top_logprobs, request.logprobs, 0)
 
             if request.echo:
                 assert prompt_text is not None
-                if request.max_tokens == 0:
-                    token_ids = prompt_token_ids
-                    output_text = prompt_text
+                token_ids = [*prompt_token_ids, *output["token_ids"]]
+                if isinstance(prompt_text, list):
+                    output_text = prompt_text[idx] + output["text"]
                 else:
-                    token_ids = [*prompt_token_ids, *output["token_ids"]]
-                    output_text = prompt_text + output["text"]
+                    output_text = str(prompt_text) + output["text"]
             else:
                 token_ids = output["token_ids"]
                 output_text = output["text"]
+            finish_reason = self.calc_finish_reason(request.max_tokens, final_res["output_token_ids"], output, False)
 
             choice_data = CompletionResponseChoice(
                 token_ids=token_ids,
@@ -438,10 +476,14 @@ class OpenAIServingCompletion:
                 text=output_text,
                 prompt_token_ids=prompt_token_ids if request.return_token_ids else None,
                 completion_token_ids=completion_token_ids if request.return_token_ids else None,
+                raw_prediction=output.get("raw_prediction") if request.return_token_ids else None,
+                completion_tokens=output.get("raw_prediction") if request.return_token_ids else None,
+                text_after_process=text_after_process_list[idx] if request.return_token_ids else None,
+                prompt_tokens=text_after_process_list[idx] if request.return_token_ids else None,
                 reasoning_content=output.get("reasoning_content"),
-                tool_calls=output.get("tool_call_content"),
+                tool_calls=output.get("tool_call"),
                 logprobs=aggregated_logprobs,
-                finish_reason=None,
+                finish_reason=finish_reason,
             )
             choices.append(choice_data)
 

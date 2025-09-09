@@ -507,6 +507,7 @@ def test_chat_with_thinking(openai_client, capsys):
         extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     )
     assert response.choices[0].message.reasoning_content is None
+    assert "</think>" not in response.choices[0].message.content
 
     # enable thinking, streaming
     reasoning_max_tokens = 3
@@ -522,7 +523,8 @@ def test_chat_with_thinking(openai_client, capsys):
         stream=True,
         max_tokens=10,
     )
-    completion_tokens = reasoning_tokens = 1
+    completion_tokens = 1
+    reasoning_tokens = 0
     total_tokens = 0
     for chunk_id, chunk in enumerate(response):
         if chunk_id == 0:  # the first chunk is an extra chunk

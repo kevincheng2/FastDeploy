@@ -34,6 +34,7 @@ class ErnieMoEVLProcessor(ErnieProcessor):
         limit_mm_per_prompt=None,
         mm_processor_kwargs=None,
         reasoning_parser_obj=None,
+        tool_parser_obj=None,
     ):
         self.use_hf_tokenizer = False
 
@@ -53,6 +54,7 @@ class ErnieMoEVLProcessor(ErnieProcessor):
         self.image_patch_id = self.ernie_processor.image_patch_id
         self.spatial_conv_size = self.ernie_processor.spatial_conv_size
 
+        self.tool_parser_dict = dict()
         self.decode_status = dict()
         self._load_tokenizer()
         self.eos_token_ids = [self.tokenizer.eos_token_id]
@@ -60,6 +62,7 @@ class ErnieMoEVLProcessor(ErnieProcessor):
         self.pad_token_id = self.get_pad_id()
         self.limit_mm_per_prompt = self._parse_limits(limit_mm_per_prompt)
         self.reasoning_parser = None
+        self.tool_parser_obj = tool_parser_obj
         if reasoning_parser_obj:
             self.reasoning_parser = reasoning_parser_obj(self.tokenizer)
 
@@ -109,7 +112,7 @@ class ErnieMoEVLProcessor(ErnieProcessor):
     def process_request(self, request, max_model_len=None, **kwargs):
         """process the input data"""
         task = request.to_dict()
-        task["enable_thinking"] = kwargs.get("enable_thinking", True)
+        task["chat_template_kwargs"] = kwargs.get("chat_template_kwargs")
         self.process_request_dict(task, max_model_len)
         request = Request.from_dict(task)
         request = self._apply_default_parameters(request)
@@ -211,10 +214,20 @@ class ErnieMoEVLProcessor(ErnieProcessor):
             self._check_mm_limits(multimodal_data)
             images = multimodal_data.get("image", None)
             videos = multimodal_data.get("video", None)
+            request["text_after_process"] = request.get("prompt")
             outputs = self.ernie_processor.text2ids(request["prompt"], images, videos)
         elif request.get("messages"):
             messages = request["messages"]
             self._check_mm_limits(messages)
+            chat_template_kwargs = request.get("chat_template_kwargs")
+            if chat_template_kwargs:
+                if isinstance(chat_template_kwargs, dict):
+                    for k, v in chat_template_kwargs.items():
+                        if k not in request:
+                            request[k] = v
+                else:
+                    raise ValueError("Invalid input: chat_template_kwargs must be a dict")
+            request.setdefault("enable_thinking", True)
             outputs = self.ernie_processor.request2ids(request)
         else:
             raise ValueError(f"Request must contain 'prompt', or 'messages': {request}")
@@ -233,6 +246,10 @@ class ErnieMoEVLProcessor(ErnieProcessor):
             request["prompt_token_ids"] = request["prompt_token_ids"][: max_model_len - 1]
         if request.get("max_tokens") is None:
             request["max_tokens"] = max(1, max_model_len - len(request["prompt_token_ids"]))
+        else:
+            request["max_tokens"] = min(max_model_len - len(request["prompt_token_ids"]), request["max_tokens"])
+        if not request.get("reasoning_max_tokens"):
+            request["reasoning_max_tokens"] = max(int(request["max_tokens"] * 0.8), 1)
         data_processor_logger.info(f"Processed request {request}")
 
         return request

@@ -24,6 +24,7 @@ import paddle
 import paddle.distributed as dist
 from paddle.distributed import fleet
 
+from fastdeploy import envs
 from fastdeploy.config import (
     CacheConfig,
     DecodingConfig,
@@ -120,6 +121,28 @@ def update_fd_config_for_mm(fd_config: FDConfig) -> None:
         fd_config.model_config.im_patch_id = tokenizer.get_vocab()["<|IMAGE_PLACEHOLDER|>"]
         fd_config.model_config.think_end_id = tokenizer.get_vocab()["</think>"]
         fd_config.model_config.sequence_parallel = fd_config.parallel_config.sequence_parallel
+
+
+def update_think_end_id_for_ernie(fd_config: FDConfig) -> None:
+    """
+    Updates the think_end_id in the model config. Uses the ID of '</think>'
+    if it exists, otherwise defaults to None.
+    """
+    is_ernie = ErnieArchitectures.contains_ernie_arch(fd_config.model_config.architectures)
+    if current_platform.is_cuda() and is_ernie:
+        tokenizer = ErnieBotTokenizer.from_pretrained(
+            fd_config.model_config.model,
+            model_max_length=fd_config.parallel_config.max_model_len,
+            padding_side="right",
+            use_fast=False,
+        )
+
+        vocab = tokenizer.get_vocab()
+        fd_config.model_config.think_end_id = vocab.get("</think>", None)
+        if fd_config.model_config.think_end_id is not None:
+            logger.info(f"Get think_end_id {fd_config.model_config.think_end_id} from vocab.")
+        else:
+            logger.info(("No </think> token found in vocabulary, The model can not do reasoning."))
 
 
 class PaddleDisWorkerProc:
@@ -243,6 +266,7 @@ class PaddleDisWorkerProc:
         Tmp loop function for ep utill DP is supported
         """
         while True:
+            num_running_requests = 0
             self.worker_healthy_live_signal.value[self.local_rank % self.max_chips_per_node] = int(time.time())
 
             if self.fd_config.parallel_config.tensor_parallel_rank == 0 and self.task_queue.num_tasks() > 0:
@@ -271,6 +295,7 @@ class PaddleDisWorkerProc:
         self.nnode = int((self.parallel_config.tensor_parallel_size + 7) // 8)
         mp_num_per_node = self.parallel_config.tensor_parallel_size // self.nnode
         req_ids = []
+        num_running_requests = 0
         while True:
             if self.local_rank == 0:
                 if self.model_weights_status.value[0] != 0:
@@ -289,8 +314,9 @@ class PaddleDisWorkerProc:
             if self.local_rank % mp_num_per_node == 0:
                 if self.task_queue.num_tasks() > 0:
                     # VL only support 1 batch to prefill
-
-                    if not self.fd_config.model_config.enable_mm or not self.worker.exist_prefill():
+                    if envs.ENABLE_V1_KVCACHE_SCHEDULER or not (
+                        self.fd_config.model_config.enable_mm and self.worker.exist_prefill()
+                    ):
                         if self.nnode > 1 and self.parallel_config.tensor_parallel_size > self.max_chips_per_node:
                             self.task_queue.read_finish_flag.set(1)
                         else:
@@ -432,6 +458,17 @@ class PaddleDisWorkerProc:
     def load_model(self) -> None:
         """Load weights and create model"""
         self.worker.load_model()
+        loaded_model_signal_data = np.zeros(shape=[1], dtype=np.int32)
+        self.loaded_model_signal = IPCSignal(
+            name="loaded_model_signal",
+            array=loaded_model_signal_data,
+            dtype=np.int32,
+            suffix=self.parallel_config.engine_pid,
+            create=False,
+        )
+        if self.ranks > 1:
+            paddle.distributed.barrier()
+        self.loaded_model_signal.value[0] = 1
 
 
 def parse_args():
@@ -587,6 +624,12 @@ def parse_args():
         help="The format of the model weights to load. default/new_loader.",
     )
 
+    parser.add_argument(
+        "--lm_head_fp32",
+        action="store_true",
+        help="Flag to specify dtype of lm_head as FP32",
+    )
+
     args = parser.parse_args()
     return args
 
@@ -706,7 +749,7 @@ def initialize_fd_config(args, ranks: int = 1, local_rank: int = 0) -> FDConfig:
         cache_config=cache_config,
     )
     update_fd_config_for_mm(fd_config)
-
+    update_think_end_id_for_ernie(fd_config)
     return fd_config
 
 
