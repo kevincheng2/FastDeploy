@@ -254,6 +254,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # When v1 is enabled, the legacy /clear_load_weight and /update_model_weight
     # will adopt this new communication pattern.
     "FD_ENABLE_V1_UPDATE_WEIGHTS": lambda: bool(int(os.getenv("FD_ENABLE_V1_UPDATE_WEIGHTS", "0"))),
+    # enable kv cache manager v1
+    "ENABLE_V1_KVCACHE_MANAGER": lambda: int(os.getenv("ENABLE_V1_KVCACHE_MANAGER", "0")),
 }
 
 
