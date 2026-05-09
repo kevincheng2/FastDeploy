@@ -283,9 +283,12 @@ class CacheManager(KVCacheBase):
                     match_result.host_nodes = []
 
                 if self.enable_prefix_caching:
-                    block_hashes = request.prompt_hashes[match_result.matched_device_nums :]
-                    all_device_blocks = request.block_tables + allocated
-                    uncached_device_blocks = all_device_blocks[match_result.matched_device_nums :]
+                    # Use len(request.block_tables) as the offset so that for chunked
+                    # prefill (chunk N>1) we only insert the *newly* allocated blocks,
+                    # not the blocks already inserted during previous chunks.
+                    num_already_allocated = len(request.block_tables)
+                    block_hashes = request.prompt_hashes[num_already_allocated:]
+                    uncached_device_blocks = allocated
                     num_block_lens = min(len(uncached_device_blocks), len(block_hashes))
 
                     if num_block_lens > 0:
@@ -696,12 +699,16 @@ class CacheManager(KVCacheBase):
                         if wasted_block_ids:
                             match_result.uncached_block_ids.extend(wasted_block_ids)
 
-                    # Release uncached blocks
+                    # Release uncached blocks: wasted blocks (already in uncached_block_ids)
+                    # plus trailing blocks that have no hash (beyond num_block_lens).
+                    # Do NOT release device_blocks[:num_block_lens] — those are now in the
+                    # radix tree (device_nodes) and must be managed by the tree.
                     uncached_blocks = match_result.uncached_block_ids
-                    uncached_blocks.extend(request.block_tables[match_result.matched_device_nums :])
+                    uncached_blocks.extend(device_blocks[num_block_lens:])
 
                     # Decrement ref count - blocks become evictable if ref_count reaches 0
-                    self._radix_tree.decrement_ref_nodes(match_result.device_nodes)
+                    # Also decrement host_nodes that were matched but not swapped to device
+                    self._radix_tree.decrement_ref_nodes(match_result.device_nodes + match_result.host_nodes)
                     self._device_pool.release(uncached_blocks)
 
                     cached_block_ids = [n.block_id for n in match_result.device_nodes]

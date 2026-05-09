@@ -930,5 +930,152 @@ class TestCacheManagerPreparePrefetchMetadata(unittest.TestCase):
         self.assertFalse(result)  # None or []
 
 
+class TestCacheManagerBugRegressions(unittest.TestCase):
+    """
+    Regression tests for three bugs fixed in allocate_device_blocks / request_finish:
+    1. Host node ref leak: host_nodes matched in match_prefix were never decremented
+       in request_finish, so repeated failed allocations leaked refs permanently.
+    2. Double-free: request_finish released block_tables[M:] to the pool even when
+       those blocks were already inserted (and owned) by the radix tree.
+    3. Phantom node (chunked prefill): allocate_device_blocks re-inserted previously
+       inserted blocks on each chunk, inflating ref counts and reducing evictable count.
+    """
+
+    def test_host_node_ref_not_leaked_after_failed_allocation(self):
+        """
+        Regression for bug 1: After match_prefix succeeds but allocation fails,
+        request_finish must decrement BOTH device_nodes AND host_nodes.
+        If only device_nodes are decremented, host nodes remain at ref=1 and
+        are never evictable again.
+        """
+        cache_manager = create_cache_manager(total_block_num=100, num_cpu_blocks=50)
+
+        # Seed the cache with some device blocks then evict them to host
+        seed_req = MockRequest(
+            request_id="seed",
+            prompt_hashes=["h1", "h2"],
+            block_tables=[],
+        )
+        cache_manager.match_prefix(seed_req)
+        allocated = cache_manager.allocate_device_blocks(seed_req, 2)
+        seed_req.block_tables = allocated
+        cache_manager.request_finish(seed_req)
+
+        # Force the two seed nodes to host by exhausting device blocks
+        for i in range(9):
+            filler = MockRequest(
+                request_id=f"filler_{i}",
+                prompt_hashes=[f"filler_{i}_{j}" for j in range(10)],
+                block_tables=[],
+            )
+            cache_manager.match_prefix(filler)
+            alloc = cache_manager.allocate_device_blocks(filler, 10)
+            filler.block_tables = alloc
+            cache_manager.request_finish(filler)
+
+        # h1/h2 nodes should now be on host
+        probe = MockRequest(
+            request_id="probe",
+            prompt_hashes=["h1", "h2"],
+            block_tables=[],
+        )
+        cache_manager.match_prefix(probe)
+        matched_host = probe._match_result.matched_host_nums
+        # Precondition: host nodes are matched (if not, test environment cannot verify the fix)
+        if matched_host == 0:
+            self.skipTest("Host eviction did not produce host nodes; skipping host-ref leak test")
+
+        # Simulate a failed allocation: allocate more than available (force failure)
+        # Don't actually allocate — just call request_finish to simulate the failing path
+        cache_manager.request_finish(probe)
+
+        # After request_finish the host nodes should be evictable again (ref=0)
+        # All matched host nodes should have been decremented back to ref=0
+        for node in probe._match_result.host_nodes:
+            self.assertEqual(
+                node.ref_count,
+                0,
+                f"Host node {node.node_id} still has ref={node.ref_count} after request_finish",
+            )
+
+    def test_no_double_free_after_request_finish(self):
+        """
+        Regression for bug 2: request_finish must NOT release blocks that are
+        already owned by the radix tree.  Doing so causes a double-ownership where
+        the pool hands out the same block to a new request while the tree still
+        references it.
+        """
+        cache_manager = create_cache_manager(total_block_num=20)
+
+        req = MockRequest(
+            request_id="req",
+            prompt_hashes=["h1", "h2", "h3"],
+            block_tables=[],
+        )
+        cache_manager.match_prefix(req)
+        allocated = cache_manager.allocate_device_blocks(req, 3)
+        req.block_tables = allocated
+        free_before = cache_manager.num_free_device_blocks
+
+        cache_manager.request_finish(req)
+
+        free_after = cache_manager.num_free_device_blocks
+        # All 3 blocks should be in the radix tree (no uncached), so pool free count is unchanged.
+        # (Blocks are evictable but still counted as used by the pool until evicted.)
+        self.assertEqual(
+            free_after,
+            free_before,
+            f"Pool free count changed from {free_before} to {free_after}: blocks were double-freed",
+        )
+
+        # Also verify the blocks are in the tree as evictable (not in pool free list)
+        stats = cache_manager.radix_tree.get_stats()
+        self.assertEqual(stats.evictable_device_count, 3)
+
+    def test_chunked_prefill_no_phantom_nodes(self):
+        """
+        Regression for bug 3: allocate_device_blocks called for chunk N>1 must
+        only insert the *newly* allocated blocks, not re-insert blocks from
+        previous chunks.  Re-insertion inflates ref counts; nodes become
+        non-evictable and evictable_device_count drops spuriously.
+        """
+        cache_manager = create_cache_manager(total_block_num=50)
+        hashes = [f"h{i}" for i in range(10)]
+
+        req = MockRequest(
+            request_id="req_chunked",
+            prompt_hashes=hashes,
+            block_tables=[],
+        )
+        cache_manager.match_prefix(req)
+
+        # Chunk 1: allocate 4 blocks
+        chunk1 = cache_manager.allocate_device_blocks(req, 4)
+        req.block_tables.extend(chunk1)
+
+        # Chunk 2: allocate 3 more blocks
+        chunk2 = cache_manager.allocate_device_blocks(req, 3)
+        req.block_tables.extend(chunk2)
+
+        # device_nodes is accumulated in req.match_result (the MockMatchResult object
+        # used by allocate_device_blocks).  With the fix, only the 4+3=7 newly
+        # inserted nodes should be present (no duplicates from re-insertion).
+        all_nodes = req.match_result.device_nodes
+        unique_node_ids = {n.node_id for n in all_nodes}
+        self.assertEqual(
+            len(unique_node_ids),
+            7,
+            f"Expected 7 unique device_nodes, got {len(unique_node_ids)}: phantom nodes were created",
+        )
+
+        # All 7 nodes must have ref_count == 1 (inserted once, not duplicated)
+        for node in req.match_result.device_nodes:
+            self.assertEqual(
+                node.ref_count,
+                1,
+                f"Node {node.node_id} has ref_count={node.ref_count}, expected 1",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
